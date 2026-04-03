@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
 from dotenv import load_dotenv
 
 from src.routes.document import router as document_router
@@ -56,6 +57,33 @@ app = FastAPI(
     },
     lifespan=lifespan,
 )
+
+# --- Custom OpenAPI schema with security scheme ---
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="Document Analysis API",
+        version="1.0.0",
+        description=(
+            "An intelligent document processing API that extracts, analyses, and summarises "
+            "content from PDF, DOCX, and image files using AI."
+        ),
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "api_key": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "x-api-key",
+            "description": "API key for authentication",
+        }
+    }
+    openapi_schema["security"] = [{"api_key": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 
 # --- CORS Middleware ---
 app.add_middleware(
