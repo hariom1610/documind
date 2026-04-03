@@ -1,0 +1,13 @@
+venv/
+.env
+src/__pycache__/
+*.pdf
+*.docx
+*.jpg
+*.png
+debug_ai.py
+.pytest_cache/
+models/__pycache__/
+routes/__pycache__/
+services/__pycache__/
+
