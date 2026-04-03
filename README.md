@@ -35,7 +35,7 @@ The system uses a completely local, multi-stage architecture: format-specific te
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/hariom1610/documind-ai.git
+git clone https://github.com/hariom1610/documind.git
 cd documind-ai
 ```
 
