@@ -27,7 +27,6 @@ router = APIRouter()
         401: {"description": "Unauthorized — invalid or missing API key"},
         500: {"description": "Internal server error during processing"},
     },
-    security=[{"api_key": []}],
 )
 async def analyze_document_endpoint(
     request: DocumentRequest,
