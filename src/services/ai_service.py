@@ -1,5 +1,6 @@
 import logging
 import re
+import threading
 from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -8,11 +9,12 @@ logger = logging.getLogger(__name__)
 _summarizer = None
 _ner_pipeline = None
 _sentiment_pipeline = None
+_models_loading = False
 
-def _get_pipelines():
+def _load_models_bg():
     global _summarizer, _ner_pipeline, _sentiment_pipeline
-    if _summarizer is None:
-        logger.info("Initializing Hugging Face Transformers models. This may take a minute...")
+    logger.info("Initializing Hugging Face Transformers models in background. This may take a minute...")
+    try:
         from transformers import pipeline
         
         # Extractive / Abstractive summarizer
@@ -35,7 +37,15 @@ def _get_pipelines():
         except Exception as e:
             logger.warning(f"Could not load sentiment: {e}")
             _sentiment_pipeline = None
-        logger.info("Transformer models successfully loaded.")
+        logger.info("Transformer models successfully loaded into memory.")
+    except Exception as e:
+        logger.error(f"Background loading error: {e}")
+
+def _get_pipelines():
+    global _models_loading, _summarizer, _ner_pipeline, _sentiment_pipeline
+    if _summarizer is None and not _models_loading:
+        _models_loading = True
+        threading.Thread(target=_load_models_bg, daemon=True).start()
         
     return _summarizer, _ner_pipeline, _sentiment_pipeline
 
