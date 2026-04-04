@@ -12,6 +12,17 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+def make_error_response(file_name: str, message: str, status_code: int = 400) -> JSONResponse:
+    content = DocumentResponse(
+        status="error",
+        fileName=file_name if file_name else "unknown",
+        message=message,
+        summary="",
+        entities=EntitiesModel(),
+        sentiment=""
+    ).model_dump(exclude_none=False)
+    return JSONResponse(status_code=status_code, content=content)
+
 
 @router.post(
     "/document-analyze",
@@ -49,81 +60,32 @@ async def analyze_document_endpoint(
         file_bytes = base64.b64decode(request.fileBase64, validate=True)
     except Exception:
         logger.warning(f"Invalid base64 for file: {file_name}")
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "fileName": file_name,
-                "message": "Invalid base64 encoding. Ensure the file is properly encoded.",
-            },
-        )
+        return make_error_response(file_name, "Invalid base64 encoding. Ensure the file is properly encoded.", 400)
 
     if len(file_bytes) == 0:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "fileName": file_name,
-                "message": "Decoded file is empty.",
-            },
-        )
+        return make_error_response(file_name, "Decoded file is empty.", 400)
 
     # --- Step 2: Extract text ---
     try:
         extracted_text = extract_text(file_bytes, file_type)
     except ValueError as e:
         logger.warning(f"Text extraction failed for {file_name}: {e}")
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "fileName": file_name,
-                "message": str(e),
-            },
-        )
+        return make_error_response(file_name, str(e), 400)
     except Exception as e:
         logger.error(f"Unexpected extraction error for {file_name}: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "fileName": file_name,
-                "message": "An unexpected error occurred during text extraction.",
-            },
-        )
+        return make_error_response(file_name, "An unexpected error occurred during text extraction.", 500)
 
     # --- Step 3: AI Analysis ---
     try:
         analysis = analyze_document(extracted_text, file_name)
     except ValueError as e:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "fileName": file_name,
-                "message": str(e),
-            },
-        )
+        return make_error_response(file_name, str(e), 400)
     except RuntimeError as e:
         logger.error(f"AI analysis failed for {file_name}: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "fileName": file_name,
-                "message": str(e),
-            },
-        )
+        return make_error_response(file_name, str(e), 500)
     except Exception as e:
         logger.error(f"Unexpected AI error for {file_name}: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "fileName": file_name,
-                "message": "An unexpected error occurred during AI analysis.",
-            },
-        )
+        return make_error_response(file_name, "An unexpected error occurred during AI analysis.", 500)
 
     # --- Step 4: Build and return response ---
     entities_data = analysis.get("entities", {})

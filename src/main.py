@@ -2,12 +2,14 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
+from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 
+from src.models.schemas import DocumentResponse, EntitiesModel
 from src.routes.document import router as document_router
 
 # Load environment variables from .env file (for local development)
@@ -58,6 +60,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Ensure 422 errors return the required JSON structure even if parsing fails."""
+    file_name = "unknown"
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            file_name = body.get("fileName", "unknown")
+    except Exception:
+        pass
+
+    content = DocumentResponse(
+        status="error",
+        fileName=file_name,
+        message="Invalid request payload. Ensure all required fields are present and valid.",
+        summary="",
+        entities=EntitiesModel(),
+        sentiment=""
+    ).model_dump(exclude_none=False)
+
+    return JSONResponse(status_code=422, content=content)
+
 # # --- Custom OpenAPI schema with security scheme ---
 # def custom_openapi():
 #     if app.openapi_schema:
@@ -99,7 +123,7 @@ app.include_router(document_router, prefix="/api", tags=["Document Analysis"])
 
 
 # --- Health check ---
-@app.get("/", tags=["Health"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["Health"])
 async def root():
     """Root endpoint — health check."""
     return JSONResponse(
@@ -112,7 +136,7 @@ async def root():
     )
 
 
-@app.get("/health", tags=["Health"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["Health"])
 async def health_check():
     """Detailed health check endpoint."""
     return JSONResponse(
