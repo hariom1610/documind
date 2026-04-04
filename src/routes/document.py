@@ -44,7 +44,7 @@ async def analyze_document_endpoint(
     file_name = request.fileName
     file_type = request.fileType
 
-    # --- Step 1: Decode base64 ---
+    # # --- Step 1: Decode base64 ---
     try:
         file_bytes = base64.b64decode(request.fileBase64, validate=True)
     except Exception:
