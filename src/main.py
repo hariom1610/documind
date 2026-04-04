@@ -58,32 +58,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# --- Custom OpenAPI schema with security scheme ---
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="Document Analysis API",
-        version="1.0.0",
-        description=(
-            "An intelligent document processing API that extracts, analyses, and summarises "
-            "content from PDF, DOCX, and image files using AI."
-        ),
-        routes=app.routes,
-    )
-    openapi_schema["components"]["securitySchemes"] = {
-        "api_key": {
-            "type": "apiKey",
-            "in": "header",
-            "name": "x-api-key",
-            "description": "API key for authentication",
-        }
-    }
-    openapi_schema["security"] = [{"api_key": []}]
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
+# # --- Custom OpenAPI schema with security scheme ---
+# def custom_openapi():
+#     if app.openapi_schema:
+#         return app.openapi_schema
+#     openapi_schema = get_openapi(
+#         title="Document Analysis API",
+#         version="1.0.0",
+#         description=(
+#             "An intelligent document processing API that extracts, analyses, and summarises "
+#             "content from PDF, DOCX, and image files using AI."
+#         ),
+#         routes=app.routes,
+#     )
+#     openapi_schema["components"]["securitySchemes"] = {
+#         "api_key": {
+#             "type": "apiKey",
+#             "in": "header",
+#             "name": "x-api-key",
+#             "description": "API key for authentication",
+#         }
+#     }
+#     openapi_schema["security"] = [{"api_key": []}]
+#     app.openapi_schema = openapi_schema
+#     return app.openapi_schema
 
-app.openapi = custom_openapi
+# app.openapi = custom_openapi
 
 # --- CORS Middleware ---
 app.add_middleware(
