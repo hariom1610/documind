@@ -7,10 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from dotenv import load_dotenv
 
-from src.models.schemas import DocumentResponse, EntitiesModel
-from src.routes.document import router as document_router
+from src.models.schemas import DocumentResponse, EntitiesModel, DocumentRequest
+from src.routes.document import router as document_router, analyze_document_endpoint
+from src.services.auth import verify_api_key
+from fastapi import Depends
 
 # Load environment variables from .env file (for local development)
 load_dotenv(override=True)
@@ -82,6 +85,28 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     return JSONResponse(status_code=422, content=content)
 
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Ensure HTTP errors (405, 404, 401) return the required JSON structure."""
+    file_name = "unknown"
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            file_name = body.get("fileName", "unknown")
+    except Exception:
+        pass
+
+    content = DocumentResponse(
+        status="error",
+        fileName=file_name,
+        message=str(exc.detail),
+        summary="",
+        entities=EntitiesModel(),
+        sentiment=""
+    ).model_dump(exclude_none=False)
+
+    return JSONResponse(status_code=exc.status_code, content=content)
+
 # # --- Custom OpenAPI schema with security scheme ---
 # def custom_openapi():
 #     if app.openapi_schema:
@@ -120,6 +145,14 @@ app.add_middleware(
 
 # --- Routes ---
 app.include_router(document_router, prefix="/api", tags=["Document Analysis"])
+
+@app.post("/", tags=["Document Analysis"])
+async def root_post_fallback(
+    request: DocumentRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """Fallback endpoint in case the tester POSTs to the root URL."""
+    return await analyze_document_endpoint(request=request, _=api_key)
 
 
 # --- Health check ---
