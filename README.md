@@ -169,3 +169,12 @@ curl http://localhost:8000/health
   "status": "healthy",
   "api_key_configured": true
 }
+```
+
+---
+
+## AI Tools used
+1. Claude Sonnet 4.5
+2. Claude Haiku
+3. Groq Code fast
+4. Gemini 3.1 Pro
