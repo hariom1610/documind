@@ -54,7 +54,7 @@ def test_document(file_path: str):
         "x-api-key": API_KEY
     }
 
-    url = "http://localhost:8000/api/document-analyze"
+    url = "http://localhost:8000/document-analyze"
     print(f"Sending API Request to {url}...")
     
     req = urllib.request.Request(url, data=data, headers=headers)

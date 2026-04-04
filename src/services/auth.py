@@ -8,11 +8,12 @@ logger = logging.getLogger(__name__)
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
-async def verify_api_key(api_key: str = Depends(api_key_header)) -> str:
+async def verify_api_key(request: Request, api_key: str = Depends(api_key_header)) -> str:
     """
     Dependency that validates the x-api-key header.
     Raises 401 if missing or invalid.
     """
+    logger.info(f"Request headers: {dict(request.headers)}")
     expected_key = os.getenv("API_KEY", "")
 
     if not api_key:
