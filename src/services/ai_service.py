@@ -1,198 +1,364 @@
 import logging
 import re
+import string
+import hashlib
 import threading
 from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# Lazy initialization of models so they don't block startup and are only loaded when requested.
+# ---------------------------------------------------------------------------
+# Global model state
+# ---------------------------------------------------------------------------
 _summarizer = None
 _ner_pipeline = None
 _sentiment_pipeline = None
-_models_loading = False
 
-def _load_models_bg():
+_models_loading = False          # guards against double-start
+_model_ready = threading.Event() # signals that loading finished (success or fail)
+_lock = threading.Lock()         # must be defined before any function uses it
+
+# ---------------------------------------------------------------------------
+# In-memory result cache
+# ---------------------------------------------------------------------------
+_analysis_cache: dict = {}
+_CACHE_MAX_SIZE = 100
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+def _load_models_bg() -> None:
+    """
+    Load all three HuggingFace pipelines in a background thread.
+    Always calls _model_ready.set() at the end so callers are never stuck.
+    """
     global _summarizer, _ner_pipeline, _sentiment_pipeline
-    logger.info("Initializing Hugging Face Transformers models in background. This may take a minute...")
+    logger.info("Loading HuggingFace models in background — this may take a minute...")
+
     try:
         from transformers import pipeline
-        
-        # Extractive / Abstractive summarizer
+
         try:
-            _summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+            # pyrefly: ignore [no-matching-overload]
+            _summarizer = pipeline(
+                task="summarization",
+                model="sshleifer/distilbart-cnn-12-6",
+            )
+            logger.info("Summarizer loaded.")
         except Exception as e:
-            logger.warning(f"Could not load summarizer: {e}")
+            logger.warning(f"Summarizer failed to load: {e}")
             _summarizer = None
-            
-        # Token classification for Named Entity Recognition (PER, ORG, LOC, MISC)
+
         try:
-            _ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+            _ner_pipeline = pipeline(
+                task="token-classification",
+                model="dslim/bert-base-NER",
+                aggregation_strategy="simple",
+            )
+            logger.info("NER pipeline loaded.")
         except Exception as e:
-            logger.warning(f"Could not load NER: {e}")
+            logger.warning(f"NER pipeline failed to load: {e}")
             _ner_pipeline = None
-            
-        # Text classification for Sentiment Analysis
+
         try:
-            _sentiment_pipeline = pipeline("text-classification", model="distilbert/distilbert-base-uncased-finetuned-sst-2-english")
+            _sentiment_pipeline = pipeline(
+                task="text-classification",
+                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+            )
+            logger.info("Sentiment pipeline loaded.")
         except Exception as e:
-            logger.warning(f"Could not load sentiment: {e}")
+            logger.warning(f"Sentiment pipeline failed to load: {e}")
             _sentiment_pipeline = None
-        logger.info("Transformer models successfully loaded into memory.")
+
+        logger.info("Model loading complete.")
+
     except Exception as e:
-        logger.error(f"Background loading error: {e}")
+        logger.error(f"Critical error during model loading: {e}")
+
+    finally:
+        # ALWAYS release waiters — even if everything failed.
+        # Without this, _get_pipelines() would block for 120 s on every request.
+        _model_ready.set()
+
 
 def _get_pipelines():
-    global _models_loading, _summarizer, _ner_pipeline, _sentiment_pipeline
-    if _summarizer is None and not _models_loading:
-        _models_loading = True
-        threading.Thread(target=_load_models_bg, daemon=True).start()
-        
+    """
+    Ensure models are loading, then block until ready (max 120 s).
+    Returns the three pipelines (any of which may be None on load failure).
+    """
+    global _models_loading
+
+    # Start background thread exactly once
+    with _lock:
+        if not _models_loading:
+            _models_loading = True
+            threading.Thread(target=_load_models_bg, daemon=True).start()
+
+    # Block the calling thread until _load_models_bg signals readiness
+    loaded = _model_ready.wait(timeout=120)
+    if not loaded:
+        raise RuntimeError(
+            "AI models did not finish loading within 120 seconds. "
+            "Check available RAM / disk space."
+        )
+
     return _summarizer, _ner_pipeline, _sentiment_pipeline
 
-def _extract_amounts(text: str) -> list[str]:
-    """Fallback Regex to extract monetary amounts as BERT NER does not handle this specifically."""
-    # Matches currency symbols paired with numbers like $100, $ 100, 10,000 USD, ₹100, etc.
-    pattern = r"(?:[\$\€\£\¥\₹]\s?[\d,]+(?:\.\d+)?|\b[\d,]+(?:\.\d+)?\s?(?:USD|EUR|GBP|INR)\b)"
-    matches = re.findall(pattern, text)
-    return list(set(matches))
 
-def _extract_dates(text: str) -> list[str]:
-    """Fallback Regex to extract standard date formats like DD/MM/YYYY, YYYY-MM-DD or DD Month YYYY"""
-    pattern = r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})\b"
-    return list(set(re.findall(pattern, text, re.IGNORECASE)))
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+def _split_into_sentence_chunks(text: str, max_chars: int = 400) -> list:
+    """
+    Split text on sentence boundaries so NER never receives a word split
+    across two chunks (which would break entity detection).
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks: list = []
+    current = ""
+
+    for sentence in sentences:
+        if len(current) + len(sentence) < max_chars:
+            current += " " + sentence
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+            current = sentence
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks
+
 
 def _fallback_extractive_summary(text: str) -> str:
-    """A pure-Python TF-like extractive summarizer if HuggingFace summarizer fails."""
-    import string
-    
-    # Simple sentence splitting
-    sentences = [s.strip() for s in text.replace('\n', '. ').split('.') if len(s.strip()) > 10]
+    """
+    Pure-Python TF-IDF-style extractive summarizer used when the
+    HuggingFace summarizer is unavailable or the input is tiny.
+    Returns the two highest-scoring sentences in their original order.
+    """
+    sentences = [
+        s.strip()
+        for s in text.replace('\n', '. ').split('.')
+        if len(s.strip()) > 10
+    ]
     if len(sentences) <= 2:
         return text.strip()
-        
+
+    stopwords = {
+        'the', 'is', 'in', 'and', 'to', 'of', 'it', 'a',
+        'for', 'on', 'with', 'as', 'by', 'this', 'that',
+    }
     words = text.lower().translate(str.maketrans('', '', string.punctuation)).split()
-    stopwords = {'the', 'is', 'in', 'and', 'to', 'of', 'it', 'a', 'for', 'on', 'with', 'as', 'by', 'this', 'that'}
-    freq = {}
-    
+    freq: dict = {}
     for w in words:
         if w not in stopwords and len(w) > 2:
             freq[w] = freq.get(w, 0) + 1
-            
-    # Score sentences
+
     scores = []
     for i, s in enumerate(sentences):
-        score = 0
-        s_words = s.lower().translate(str.maketrans('', '', string.punctuation)).split()
-        for w in s_words:
-            if w in freq:
-                score += freq[w]
+        score = sum(
+            freq.get(w, 0)
+            for w in s.lower()
+                       .translate(str.maketrans('', '', string.punctuation))
+                       .split()
+        )
         scores.append((score, i, s))
-        
-    # Get top 2 scoring sentences, sort them back to original appearance order
-    scores.sort(reverse=True, key=lambda x: x[0])
-    top_sentences = sorted(scores[:2], key=lambda x: x[1])
-    
-    return ". ".join([s[2] for s in top_sentences]) + "."
 
+    scores.sort(reverse=True, key=lambda x: x[0])
+    top = sorted(scores[:2], key=lambda x: x[1])
+    return ". ".join(t[2] for t in top) + "."
+
+
+def _summarize_long_text(text: str, summarizer) -> str:
+    """
+    Map-reduce summarization:
+      1. Split text into ~800-word chunks (covers up to 6 000 words / ~12 pages).
+      2. Summarize each chunk independently.
+      3. Concatenate chunk summaries; if still long, run one final summarization pass.
+    Falls back to extractive summary on any pipeline failure.
+    """
+    words = text.split()
+    chunk_size = 800
+    chunks = []
+
+    for i in range(0, min(len(words), 6000), chunk_size):
+        chunk = " ".join(words[i : i + chunk_size])
+        if len(chunk.split()) > 30:
+            chunks.append(chunk)
+
+    if not chunks:
+        return _fallback_extractive_summary(text)
+
+    chunk_summaries = []
+    for chunk in chunks:
+        try:
+            result = summarizer(
+                chunk, max_length=60, min_length=10, do_sample=False
+            )
+            chunk_summaries.append(result[0]["summary_text"])
+        except Exception as e:
+            logger.warning(f"Chunk summarization failed: {e}")
+            chunk_summaries.append(_fallback_extractive_summary(chunk))
+
+    combined = " ".join(chunk_summaries)
+
+    # Second pass if combined is still long
+    if len(combined.split()) > 80:
+        try:
+            final = summarizer(
+                combined, max_length=100, min_length=20, do_sample=False
+            )
+            return final[0]["summary_text"]
+        except Exception as e:
+            logger.warning(f"Final summarization pass failed: {e}")
+
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Regex extractors
+# ---------------------------------------------------------------------------
+def _extract_amounts(text: str) -> list:
+    """
+    Extract monetary amounts including Indian formats (lakh/crore, Rs.).
+    BERT NER does not handle currencies natively, so regex is the right tool here.
+    """
+    pattern = r"""(?x)
+        (?:[\$\€\£\¥\₹\₩]\s?[\d,]+(?:\.\d+)?)        |
+        (?:[\d,]+(?:\.\d+)?\s?(?:USD|EUR|GBP|INR|JPY)) |
+        (?:(?:Rs|INR)\.?\s?[\d,]+(?:\.\d+)?)           |
+        (?:[\d,]+(?:\.\d+)?\s?(?:lakh|lakhs|crore|crores))
+    """
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    return list({m.strip() for m in matches if m.strip()})
+
+
+def _extract_dates(text: str) -> list:
+    """
+    Extract dates in common formats:
+      DD/MM/YYYY, YYYY-MM-DD, 12 March 2024, March 12, 2024
+    """
+    pattern = r"""(?x)
+        \b(?:
+            \d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}                       |
+            \d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}                          |
+            \d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|
+                         Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}           |
+            (?:Jan|Feb|Mar|Apr|May|Jun|
+               Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}
+        )\b
+    """
+    return list(set(re.findall(pattern, text, re.IGNORECASE | re.VERBOSE)))
+
+
+# ---------------------------------------------------------------------------
+# Main analysis entry point
+# ---------------------------------------------------------------------------
 def analyze_document(text: str, file_name: str) -> Dict[str, Any]:
     """
-    Main function: analyzes text using pure Hugging Face Transformer pipelines and Regex.
-    No external API required.
+    Full analysis pipeline:
+      1. Cache check   — return immediately if this exact text was seen before.
+      2. Summarization — map-reduce with HuggingFace; falls back to extractive.
+      3. Sentiment     — DistilBERT classifier; falls back to Neutral.
+      4. NER           — BERT-NER on sentence-boundary chunks; extracts PER/ORG/LOC.
+      5. Regex         — Amounts and dates (not handled well by NER models).
+      6. Cache store   — evict oldest entry if cache is full.
     """
     if not text or not text.strip():
-        raise ValueError("Cannot analyze empty document content")
+        raise ValueError("Cannot analyze empty document content.")
 
-    logger.info(f"Analyzing document locally via Transformers: {file_name} ({len(text)} chars)")
+    # --- 0. Cache check ---
+    cache_key = hashlib.md5(text.encode()).hexdigest()
+    if cache_key in _analysis_cache:
+        logger.info(f"Cache hit for '{file_name}'")
+        return _analysis_cache[cache_key]
 
+    logger.info(f"Analyzing '{file_name}' ({len(text)} chars) ...")
     summarizer, ner, sentiment_classifier = _get_pipelines()
-    
-    # 1. Summarization
+
+    # --- 1. Summarization ---
     summary_text = ""
     try:
-        trunc_text_summ = text[:2500]
-        input_length = len(trunc_text_summ.split())
-        max_len = min(60, max(20, input_length - 5))
-        min_len = min(20, max_len - 5)
-        
-        if summarizer and input_length > 30:
-            summary_result = summarizer(trunc_text_summ, max_length=max_len, min_length=min_len, do_sample=False)
-            summary_text = summary_result[0]['summary_text']
-        elif input_length > 30:
-            # Dropdown to our safe mathematical summarizer
-            summary_text = _fallback_extractive_summary(trunc_text_summ)
-        else:
+        word_count = len(text.split())
+        if word_count <= 30:
             summary_text = "Document is too short for a reliable summary."
+        elif summarizer:
+            summary_text = _summarize_long_text(text, summarizer)
+        else:
+            summary_text = _fallback_extractive_summary(text[:2500])
     except Exception as e:
-        logger.warning(f"Summarization pipeline failed: {e}")
-        # Final safety net
+        logger.warning(f"Summarization error: {e}")
         summary_text = _fallback_extractive_summary(text[:2500])
 
-    # 2. Sentiment Analysis
+    # --- 2. Sentiment ---
+    # Use first 2 000 chars; sentiment of an entire 50-page doc is rarely meaningful
+    # beyond the opening sections, and the model has a 512-token hard limit anyway.
     sentiment = "Neutral"
     try:
         if sentiment_classifier:
-            trunc_text_sent = text[:2000]
-            sent_result = sentiment_classifier(trunc_text_sent)[0]
-            
-            label = sent_result['label'].upper()
+            result = sentiment_classifier(text[:2000])[0]
+            label = result["label"].upper()
             if label == "POSITIVE":
                 sentiment = "Positive"
             elif label == "NEGATIVE":
                 sentiment = "Negative"
     except Exception as e:
-        logger.warning(f"Sentiment pipeline failed: {e}")
+        logger.warning(f"Sentiment error: {e}")
 
-    # 3. Named Entity Recognition
-    names = set()
-    organizations = set()
-    locations = set()
-    
+    # --- 3. NER ---
+    names: set = set()
+    organizations: set = set()
+    locations: set = set()
+
     if ner:
-        chunk_size = 1500
-        for i in range(0, len(text), chunk_size):
-            chunk = text[i:i+chunk_size]
-            if not chunk.strip(): 
+        for chunk in _split_into_sentence_chunks(text, max_chars=400):
+            if not chunk.strip():
                 continue
             try:
-                ent_results = ner(chunk)
-                for ent in ent_results:
-                    group = ent.get('entity_group', '')
-                    word = ent.get('word', '').strip()
-                    
-                    if word.startswith("##") or len(word) < 2: 
+                for ent in ner(chunk):
+                    group = ent.get("entity_group", "")
+                    word = ent.get("word", "").strip()
+                    # Skip BPE continuation tokens and single characters
+                    if word.startswith("##") or len(word) < 2:
                         continue
-                    
-                    if group == 'PER':
+                    if group == "PER":
                         names.add(word)
-                    elif group == 'ORG':
+                    elif group == "ORG":
                         organizations.add(word)
-                    elif group == 'LOC':
+                    elif group == "LOC":
                         locations.add(word)
             except Exception as e:
-                logger.warning(f"NER failed on a text chunk: {e}")
+                logger.warning(f"NER chunk error: {e}")
 
-    # 4. Fallback Extraction (Dates and Amounts)
+    # --- 4. Regex fallbacks ---
     amounts = _extract_amounts(text)
     dates = _extract_dates(text)
 
-    # Compile result
-    result = {
+    # --- 5. Compile result ---
+    result: Dict[str, Any] = {
         "summary": summary_text.strip(),
         "entities": {
-            "names": list(names),
+            "names": sorted(names),
             "dates": dates,
-            "organizations": list(organizations),
+            "organizations": sorted(organizations),
             "amounts": amounts,
-            "locations": list(locations)
+            "locations": sorted(locations),
         },
-        "sentiment": sentiment
+        "sentiment": sentiment,
     }
-    
+
     logger.info(
-        f"Analysis complete for {file_name} | "
-        f"Sentiment: {result['sentiment']} | "
-        f"Names: {len(result['entities']['names'])} | "
-        f"Orgs: {len(result['entities']['organizations'])}"
+        f"Done — '{file_name}' | sentiment={sentiment} | "
+        f"names={len(names)} orgs={len(organizations)} "
+        f"locs={len(locations)} dates={len(dates)} amounts={len(amounts)}"
     )
+
+    # --- 6. Store in cache (evict oldest if full) ---
+    if len(_analysis_cache) >= _CACHE_MAX_SIZE:
+        oldest = next(iter(_analysis_cache))
+        del _analysis_cache[oldest]
+    _analysis_cache[cache_key] = result
 
     return result

@@ -8,6 +8,10 @@ from src.services.auth import verify_api_key
 from src.services.extractor import extract_text
 from src.services.ai_service import analyze_document
 
+import asyncio
+from functools import partial
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -58,6 +62,9 @@ async def analyze_document_endpoint(
     # # --- Step 1: Decode base64 ---
     try:
         file_bytes = base64.b64decode(request.fileBase64, validate=True)
+        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+        if len(file_bytes) > MAX_FILE_SIZE:
+            return make_error_response(file_name, "File too large. Max 10MB.", 413)
     except Exception:
         logger.warning(f"Invalid base64 for file: {file_name}")
         return make_error_response(file_name, "Invalid base64 encoding. Ensure the file is properly encoded.", 400)
@@ -67,7 +74,11 @@ async def analyze_document_endpoint(
 
     # --- Step 2: Extract text ---
     try:
-        extracted_text = extract_text(file_bytes, file_type)
+        loop = asyncio.get_event_loop()
+        extracted_text = await loop.run_in_executor(
+            None,
+            partial(extract_text, file_bytes, file_type)
+        )
     except ValueError as e:
         logger.warning(f"Text extraction failed for {file_name}: {e}")
         return make_error_response(file_name, str(e), 400)
@@ -77,7 +88,11 @@ async def analyze_document_endpoint(
 
     # --- Step 3: AI Analysis ---
     try:
-        analysis = analyze_document(extracted_text, file_name)
+        loop = asyncio.get_event_loop()
+        analysis = await loop.run_in_executor(
+            None,
+            partial(analyze_document, extracted_text, file_name)
+        )
     except ValueError as e:
         return make_error_response(file_name, str(e), 400)
     except RuntimeError as e:

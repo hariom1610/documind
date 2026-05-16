@@ -15,6 +15,7 @@ from src.routes.document import router as document_router, analyze_document_endp
 from src.services.auth import verify_api_key
 from fastapi import Depends
 
+
 # Load environment variables from .env file (for local development)
 load_dotenv(override=True)
 
@@ -29,22 +30,27 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown lifecycle events."""
     logger.info("=== Document Analysis API starting up ===")
-
-    # Validate required environment variables on startup
     missing = []
     if not os.getenv("API_KEY"):
         missing.append("API_KEY")
-
     if missing:
-        logger.error(f"Missing required environment variables: {', '.join(missing)}")
+        logger.error(f"Missing env vars: {', '.join(missing)}")
     else:
-        logger.info("All required environment variables are set.")
-
+        logger.info("All env vars set.")
+    
+    # START model loading immediately at startup
+    from src.services.ai_service import _load_models_bg, _models_loading
+    import src.services.ai_service as ai_svc
+    import threading
+    
+    if not ai_svc._models_loading:
+        ai_svc._models_loading = True
+        threading.Thread(target=_load_models_bg, daemon=True).start()
+        logger.info("Model loading started in background during startup.")
+    
     yield
-
-    logger.info("=== Document Analysis API shutting down ===")
+    logger.info("=== Shutting down ===")
 
 
 # --- FastAPI app ---
@@ -99,40 +105,12 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     content = DocumentResponse(
         status="error",
         fileName=file_name,
-        message=str(exc.detail),
         summary="",
         entities=EntitiesModel(),
         sentiment=""
     ).model_dump(exclude_none=False)
 
     return JSONResponse(status_code=exc.status_code, content=content)
-
-# # --- Custom OpenAPI schema with security scheme ---
-# def custom_openapi():
-#     if app.openapi_schema:
-#         return app.openapi_schema
-#     openapi_schema = get_openapi(
-#         title="Document Analysis API",
-#         version="1.0.0",
-#         description=(
-#             "An intelligent document processing API that extracts, analyses, and summarises "
-#             "content from PDF, DOCX, and image files using AI."
-#         ),
-#         routes=app.routes,
-#     )
-#     openapi_schema["components"]["securitySchemes"] = {
-#         "api_key": {
-#             "type": "apiKey",
-#             "in": "header",
-#             "name": "x-api-key",
-#             "description": "API key for authentication",
-#         }
-#     }
-#     openapi_schema["security"] = [{"api_key": []}]
-#     app.openapi_schema = openapi_schema
-#     return app.openapi_schema
-
-# app.openapi = custom_openapi
 
 # --- CORS Middleware ---
 app.add_middleware(
