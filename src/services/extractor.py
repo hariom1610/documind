@@ -16,7 +16,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         pages_text = []
 
-        for page_num, page in enumerate(doc):
+        for page in doc:
             text = page.get_text("text")
             pages_text.append(text)
 
@@ -36,31 +36,47 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 
 def _ocr_pdf_pages(file_bytes: bytes) -> str:
-    """OCR fallback for scanned PDFs — renders each page as image and runs Tesseract."""
+    """OCR fallback for scanned PDFs — renders each page as image and runs Tesseract in parallel."""
     try:
         import fitz
         import pytesseract
         from PIL import Image
+        from concurrent.futures import ThreadPoolExecutor
+        import os
 
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        ocr_texts = []
+        pages_img_bytes = []
 
+        # Rendering pages is extremely fast in PyMuPDF (fitz), so we render sequentially
         for page in doc:
             # Render page at 2x zoom for better OCR accuracy
             mat = fitz.Matrix(2.0, 2.0)
             pix = page.get_pixmap(matrix=mat)
-            img_bytes = pix.tobytes("png")
-            img = Image.open(io.BytesIO(img_bytes))
-
-            text = pytesseract.image_to_string(img, config="--oem 3 --psm 6")
-            ocr_texts.append(text)
+            pages_img_bytes.append(pix.tobytes("png"))
 
         doc.close()
-        return "\n".join(ocr_texts).strip()
+
+        def ocr_single_page(img_bytes: bytes) -> str:
+            try:
+                img = Image.open(io.BytesIO(img_bytes))
+                return pytesseract.image_to_string(img, config="--oem 3 --psm 6")
+            except Exception as page_err:
+                logger.error(f"Page OCR processing failed: {page_err}")
+                return ""
+
+        # Run Tesseract OCR in parallel across CPU cores. Limit max workers to 4.
+        max_workers = min(4, os.cpu_count() or 2)
+        logger.info(f"Running parallel PDF OCR using {max_workers} threads for {len(pages_img_bytes)} pages.")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            ocr_texts = list(executor.map(ocr_single_page, pages_img_bytes))
+
+        return "\n".join(t.strip() for t in ocr_texts if t.strip()).strip()
 
     except Exception as e:
         logger.error(f"PDF OCR fallback failed: {e}")
         return ""
+
 
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
@@ -90,6 +106,13 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
                         row_texts.append(cell_text)
                 if row_texts:
                     content_parts.append(" | ".join(row_texts))
+        for section in doc.sections:
+            for container in [section.header, section.footer]:
+                if container:
+                    for para in container.paragraphs:
+                        text = para.text.strip()
+                        if text:
+                            content_parts.append(text)
 
         full_text = "\n".join(content_parts).strip()
 

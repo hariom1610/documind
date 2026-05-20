@@ -39,12 +39,11 @@ def _load_models_bg() -> None:
     try:
         from transformers import pipeline
 
-        try:
-            # pyrefly: ignore [no-matching-overload]
+        try: 
             _summarizer = pipeline(
-                task="summarization",
+                task="summarization", # type: ignore
                 model="sshleifer/distilbart-cnn-12-6",
-            )
+            )# type: ignore 
             logger.info("Summarizer loaded.")
         except Exception as e:
             logger.warning(f"Summarizer failed to load: {e}")
@@ -104,6 +103,18 @@ def _get_pipelines():
         )
 
     return _summarizer, _ner_pipeline, _sentiment_pipeline
+
+
+# Public getters for API health checks
+def get_models_status():
+    """Get current status of model loading and availability."""
+    return {
+        "is_loading": _models_loading,
+        "is_ready": _model_ready.is_set(),
+        "summarizer_loaded": _summarizer is not None,
+        "ner_loaded": _ner_pipeline is not None,
+        "sentiment_loaded": _sentiment_pipeline is not None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +186,7 @@ def _summarize_long_text(text: str, summarizer) -> str:
     """
     Map-reduce summarization:
       1. Split text into ~800-word chunks (covers up to 6 000 words / ~12 pages).
-      2. Summarize each chunk independently.
+      2. Summarize each chunk in parallel batch.
       3. Concatenate chunk summaries; if still long, run one final summarization pass.
     Falls back to extractive summary on any pipeline failure.
     """
@@ -192,15 +203,25 @@ def _summarize_long_text(text: str, summarizer) -> str:
         return _fallback_extractive_summary(text)
 
     chunk_summaries = []
-    for chunk in chunks:
-        try:
-            result = summarizer(
-                chunk, max_length=60, min_length=10, do_sample=False
-            )
-            chunk_summaries.append(result[0]["summary_text"])
-        except Exception as e:
-            logger.warning(f"Chunk summarization failed: {e}")
-            chunk_summaries.append(_fallback_extractive_summary(chunk))
+    try:
+        # Utilize HuggingFace batching capabilities by passing all chunks together
+        # Specifying batch_size allows internal optimization.
+        logger.info(f"Running batch summarization on {len(chunks)} text chunks...")
+        results = summarizer(chunks, max_length=60, min_length=10, do_sample=False, batch_size=4)
+        for res in results:
+            chunk_summaries.append(res["summary_text"])
+    except Exception as e:
+        logger.warning(f"Batch summarization failed, falling back to sequential processing: {e}")
+        chunk_summaries = []
+        for chunk in chunks:
+            try:
+                result = summarizer(
+                    chunk, max_length=60, min_length=10, do_sample=False
+                )
+                chunk_summaries.append(result[0]["summary_text"])
+            except Exception as e_inner:
+                logger.warning(f"Individual chunk summarization failed: {e_inner}")
+                chunk_summaries.append(_fallback_extractive_summary(chunk))
 
     combined = " ".join(chunk_summaries)
 
@@ -215,6 +236,7 @@ def _summarize_long_text(text: str, summarizer) -> str:
             logger.warning(f"Final summarization pass failed: {e}")
 
     return combined
+
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +292,7 @@ def analyze_document(text: str, file_name: str) -> Dict[str, Any]:
         raise ValueError("Cannot analyze empty document content.")
 
     # --- 0. Cache check ---
-    cache_key = hashlib.md5(text.encode()).hexdigest()
+    cache_key = hashlib.sha256(text.encode()).hexdigest()
     if cache_key in _analysis_cache:
         logger.info(f"Cache hit for '{file_name}'")
         return _analysis_cache[cache_key]
@@ -298,7 +320,7 @@ def analyze_document(text: str, file_name: str) -> Dict[str, Any]:
     sentiment = "Neutral"
     try:
         if sentiment_classifier:
-            result = sentiment_classifier(text[:2000])[0]
+            result = sentiment_classifier(text,truncation=True,max_length=512)[0]
             label = result["label"].upper()
             if label == "POSITIVE":
                 sentiment = "Positive"
@@ -313,24 +335,34 @@ def analyze_document(text: str, file_name: str) -> Dict[str, Any]:
     locations: set = set()
 
     if ner:
-        for chunk in _split_into_sentence_chunks(text, max_chars=400):
-            if not chunk.strip():
-                continue
+        chunks = [c.strip() for c in _split_into_sentence_chunks(text, max_chars=400) if c.strip()]
+        if chunks:
             try:
-                for ent in ner(chunk):
-                    group = ent.get("entity_group", "")
-                    word = ent.get("word", "").strip()
-                    # Skip BPE continuation tokens and single characters
-                    if word.startswith("##") or len(word) < 2:
-                        continue
-                    if group == "PER":
-                        names.add(word)
-                    elif group == "ORG":
-                        organizations.add(word)
-                    elif group == "LOC":
-                        locations.add(word)
+                logger.info(f"Running batch NER on {len(chunks)} text chunks...")
+                # HuggingFace token classification pipelines support batch inference by passing a list
+                batch_results = ner(chunks, batch_size=16)
+                
+                # Normalize output: if only a single chunk is passed, HF might return a list of dicts.
+                # If multiple chunks, it returns a list of lists of dicts.
+                if batch_results and isinstance(batch_results[0], dict):
+                    batch_results = [batch_results]
+                    
+                for chunk_res in batch_results:
+                    for ent in chunk_res:
+                        group = ent.get("entity_group", "") # type: ignore
+                        word = ent.get("word", "").strip() # type: ignore
+                        # Skip BPE continuation tokens and single characters
+                        if word.startswith("##") or len(word) < 2:
+                            continue
+                        if group == "PER":
+                            names.add(word)
+                        elif group == "ORG":
+                            organizations.add(word)
+                        elif group == "LOC":
+                            locations.add(word)
             except Exception as e:
-                logger.warning(f"NER chunk error: {e}")
+                logger.warning(f"Batch NER processing failed: {e}")
+
 
     # --- 4. Regex fallbacks ---
     amounts = _extract_amounts(text)

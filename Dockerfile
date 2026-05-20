@@ -36,4 +36,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 
 # Run the application
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Note: --timeout-keep-alive controls how long to keep idle connections open
+# --timeout-notify controls time to wait for graceful shutdown
+# Models may take up to 120s to load on first request, so we use appropriate timeouts
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-keep-alive", "180", "--timeout-notify", "180"]

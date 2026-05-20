@@ -39,15 +39,12 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("All env vars set.")
     
-    # START model loading immediately at startup
-    from src.services.ai_service import _load_models_bg, _models_loading
-    import src.services.ai_service as ai_svc
+    # START model loading immediately at startup in background
+    from src.services.ai_service import _get_pipelines
     import threading
-    
-    if not ai_svc._models_loading:
-        ai_svc._models_loading = True
-        threading.Thread(target=_load_models_bg, daemon=True).start()
-        logger.info("Model loading started in background during startup.")
+    threading.Thread(target=_get_pipelines, daemon=True).start()
+    logger.info("Model loading started in background during startup (may take up to 2 minutes).")
+    logger.info("Use /models-ready endpoint to check model loading status.")
     
     yield
     logger.info("=== Shutting down ===")
@@ -69,14 +66,60 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# --- Custom OpenAPI schema with security definition ---
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    openapi_schema = get_openapi(
+        title="Document Analysis API",
+        version="1.0.0",
+        description=(
+            "An intelligent document processing API that extracts, analyses, and summarises "
+            "content from PDF, DOCX, and image files using AI.\n\n"
+            "**Authentication**: All endpoints except `/health` and `/models-ready` require the `x-api-key` header.\n\n"
+            "**Important**: On first request, models will load (takes 30-120 seconds). "
+            "Use `/models-ready` to check if models are ready before sending analysis requests."
+        ),
+        routes=app.routes,
+    )
+    
+    # Add API key security scheme without overwriting other generated components
+    components = openapi_schema.setdefault("components", {})
+    security_schemes = components.setdefault("securitySchemes", {})
+    security_schemes["ApiKeyHeader"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "API key for authentication. Contact the API administrator for access."
+    }
+    
+    # Mark all endpoints (except health) as requiring API key
+    for path, path_item in openapi_schema.get("paths", {}).items():
+        if path not in ["/", "/health", "/models-ready"]:
+            for operation in path_item.values():
+                if isinstance(operation, dict) and "security" not in operation:
+                    operation["security"] = [{"ApiKeyHeader": []}]
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Ensure 422 errors return the required JSON structure even if parsing fails."""
     file_name = "unknown"
     try:
-        body = await request.json()
-        if isinstance(body, dict):
-            file_name = body.get("fileName", "unknown")
+        # Check if json was already parsed and cached by Starlette
+        if hasattr(request, "_json") and isinstance(request._json, dict):
+            file_name = request._json.get("fileName", "unknown")
+        else:
+            body = await request.json()
+            if isinstance(body, dict):
+                file_name = body.get("fileName", "unknown")
     except Exception:
         pass
 
@@ -93,14 +136,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Ensure HTTP errors (405, 404, 401) return the required JSON structure."""
     file_name = "unknown"
-    try:
-        body = await request.json()
-        if isinstance(body, dict):
-            file_name = body.get("fileName", "unknown")
-    except Exception:
-        pass
+    if request.method in ("POST", "PUT", "PATCH"):
+        try:
+            if hasattr(request, "_json") and isinstance(request._json, dict):
+                file_name = request._json.get("fileName", "unknown")
+            else:
+                body = await request.json()
+                if isinstance(body, dict):
+                    file_name = body.get("fileName", "unknown")
+        except Exception:
+            pass
 
     content = DocumentResponse(
         status="error",
@@ -111,6 +157,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     ).model_dump(exclude_none=False)
 
     return JSONResponse(status_code=exc.status_code, content=content)
+
 
 # --- CORS Middleware ---
 app.add_middleware(
@@ -156,3 +203,51 @@ async def health_check():
             "api_key_configured": bool(os.getenv("API_KEY")),
         }
     )
+
+
+@app.api_route("/models-ready", methods=["GET", "HEAD"], tags=["Health"])
+async def models_ready():
+    """
+    Check if AI models are ready for analysis.
+    
+    Returns:
+    - status: "ready" if models loaded successfully, "loading" if still loading, "error" if loading failed
+    - message: Human-readable status message
+    - details: More info about which models are available
+    """
+    from src.services.ai_service import get_models_status
+    
+    status_info = get_models_status()
+    
+    if not status_info["is_loading"]:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "idle",
+                "message": "Models have not been requested yet. First API request will trigger loading.",
+                "next_action": "Send a document analysis request to start model loading",
+            }
+        )
+    
+    if status_info["is_ready"]:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ready",
+                "message": "AI models are loaded and ready for analysis.",
+                "models": {
+                    "summarizer": status_info["summarizer_loaded"],
+                    "ner_pipeline": status_info["ner_loaded"],
+                    "sentiment_pipeline": status_info["sentiment_loaded"],
+                },
+            }
+        )
+    else:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "loading",
+                "message": "Models are still loading. Please wait and retry in 10-30 seconds.",
+                "estimated_wait_seconds": "30-120 depending on system resources",
+            }
+        )
